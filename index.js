@@ -181,6 +181,56 @@ app.post("/slack/commands", async (req, res) => {
   }
 });
 
+// -------- /question-query --------
+if (command === "/question-query") {
+  const domainFilter = text.trim().toLowerCase();
+  const list = Object.values(questions)
+    .filter(q => !domainFilter || q.domain.toLowerCase() === domainFilter)
+    .map(q => `*${q.id}* (${q.domain}) - ${q.text}`);
+
+  await axios.post(SLACK_WEBHOOK_URL, {
+    text: list.length ? list.join("\n") : "No questions found."
+  });
+}
+
+// -------- /leaderboard --------
+if (command === "/leaderboard") {
+  // leaderboard for kudos
+  const leaderboard = Object.entries(kudos)
+    .sort((a,b) => b[1] - a[1])
+    .map(([user, points], i) => `${i+1}. <@${user}> - ${points} points`);
+
+  await axios.post(SLACK_WEBHOOK_URL, {
+    text: leaderboard.length ? "*Kudos Leaderboard:*\n" + leaderboard.join("\n") : "No users yet."
+  });
+}
+
+// -------- /expertise --------
+if (command === "/expertise") {
+  const args = text.split(" ");
+  const action = args[0];
+  const domainName = args.slice(1).join(" ");
+
+  if (action === "add" && domainName) {
+    expertise[user_id] = expertise[user_id] || [];
+    if (!expertise[user_id].includes(domainName)) {
+      expertise[user_id].push(domainName);
+      domains[domainName] = true;
+    }
+    await axios.post(SLACK_WEBHOOK_URL, {
+      text: `<@${user_id}> added themselves to domain *${domainName}*`
+    });
+  }
+
+  if (action === "show") {
+    const list = (expertise[user_id] || []).map(d => `- ${d}`);
+    await axios.post(SLACK_WEBHOOK_URL, {
+      text: list.length ? `Your domains:\n${list.join("\n")}` : "You have no domains."
+    });
+  }
+}
+
+
 // ================== Modal Interactions ==================
 app.post("/slack/interactions", async (req, res) => {
   const payload = JSON.parse(req.body.payload);

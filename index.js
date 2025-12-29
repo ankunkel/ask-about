@@ -120,12 +120,60 @@ app.post("/slack/commands", async (req, res) => {
   }
 
   // ================== /answer ==================
-  else if (command === "/answer") {
-    const questionId = args[0];
-    const answerText = args.slice(1).join(" ");
+else if (command === "/answer") {
+  const questionId = args[0];
+  const remainingArgs = args.slice(1);
+  
+  if (!questions[questionId]) return;
 
-    if (!questions[questionId]) return;
+  // Check if marking best answer
+  if (remainingArgs[0] === "best") {
+    // Only the question author can mark best answer
+    if (questions[questionId].author !== user_id) {
+      await postToSlack([
+        { type: "section", text: { type: "mrkdwn", text: `:no_entry: Only the question author can mark the best answer.` } }
+      ]);
+      return;
+    }
 
+    const bestAnswerText = remainingArgs.slice(1).join(" ");
+    if (!bestAnswerText) {
+      await postToSlack([
+        { type: "section", text: { type: "mrkdwn", text: `:warning: Please include the answer text to mark as best.` } }
+      ]);
+      return;
+    }
+
+    // Find the answer
+    const answerObj = questions[questionId].answers.find(a => a.text === bestAnswerText);
+    if (!answerObj) {
+      await postToSlack([
+        { type: "section", text: { type: "mrkdwn", text: `:warning: Answer not found for question ${questionId}.` } }
+      ]);
+      return;
+    }
+
+    // Mark as best
+    answerObj.best = true;
+
+    // Award points
+    const bonusPoints = 10;
+    kudos[answerObj.user] = (kudos[answerObj.user] || 0) + bonusPoints;
+
+    // Award optional badge
+    const badgeName = remainingArgs[remainingArgs.length - 1]; // last arg as badge (optional)
+    if (badgeName && badgeName !== bestAnswerText) {
+      badges[answerObj.user] = badges[answerObj.user] || [];
+      badges[answerObj.user].push(badgeName);
+    }
+
+    await postToSlack([
+      { type: "section", text: { type: "mrkdwn", text: `:tada: *Best Answer!* <@${answerObj.user}> for question ${questionId}` } },
+      { type: "section", text: { type: "mrkdwn", text: `Awarded ${bonusPoints} points${badgeName ? ` and badge *${badgeName}*` : ""}!` } }
+    ]);
+  } else {
+    // Regular answer submission
+    const answerText = remainingArgs.join(" ");
     const answerObj = { user: user_id, text: answerText, best: false };
     questions[questionId].answers.push(answerObj);
 
@@ -133,6 +181,8 @@ app.post("/slack/commands", async (req, res) => {
       { type: "section", text: { type: "mrkdwn", text: `💡 <@${user_id}> answered question *${questionId}*:\n"${answerText}"` } }
     ]);
   }
+}
+
 
   // ================== /leaderboard ==================
   else if (command === "/leaderboard") {

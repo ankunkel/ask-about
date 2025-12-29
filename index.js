@@ -1,115 +1,130 @@
-require("dotenv").config();
+// index.js
 const express = require("express");
 const bodyParser = require("body-parser");
 const axios = require("axios");
-
 const app = express();
-
-// Slack sends application/x-www-form-urlencoded
-app.use(bodyParser.urlencoded({ extended: true }));
-app.use(bodyParser.json());
-
 const PORT = process.env.PORT || 3000;
 
-// --------------------
-// In-memory storage (MVP only)
-// --------------------
+// Parse application/x-www-form-urlencoded (Slack sends this)
+app.use(bodyParser.urlencoded({ extended: true }));
+
+// In-memory storage for demo purposes
 const kudos = {};
 const expertise = {};
 
-// --------------------
-// Home Page
-// --------------------
-app.get("/", (req, res) => {
-  res.send(`
-    <h1>BadgeUp</h1>
-    <p>Highlight who to ask about what.</p>
-    <a href="https://slack.com/oauth/v2/authorize?client_id=${process.env.SLACK_CLIENT_ID}&scope=commands,chat:write,users:read&redirect_uri=${process.env.REDIRECT_URI}">
-      <button>Add to Slack</button>
-    </a>
-  `);
-});
-
-// --------------------
-// OAuth Callback
-// --------------------
-app.get("/slack/oauth/callback", async (req, res) => {
-  const code = req.query.code;
-
-  try {
-    const response = await axios.post(
-      "https://slack.com/api/oauth.v2.access",
-      null,
-      {
-        params: {
-          code,
-          client_id: process.env.SLACK_CLIENT_ID,
-          client_secret: process.env.SLACK_CLIENT_SECRET,
-          redirect_uri: process.env.REDIRECT_URI,
-        },
-      }
-    );
-
-    if (!response.data.ok) {
-      return res.send("OAuth failed");
-    }
-
-    res.send("✅ BadgeUp installed successfully! You can close this tab.");
-  } catch (err) {
-    res.status(500).send("OAuth error");
-  }
-});
-
-// --------------------
-// Slash Commands
-// --------------------
 app.post("/slack/commands", async (req, res) => {
   const { command, text, user_id, user_name } = req.body;
 
-  // Respond immediately (Slack requires <3s)
+  // Respond immediately to Slack (required <3s)
   res.send("");
 
-  // /kudos
-  if (command === "/kudos") {
-    kudos[user_id] = (kudos[user_id] || 0) + 10;
+  try {
+    if (command === "/kudos") {
+      // Update kudos
+      const points = 5;
+      kudos[user_id] = (kudos[user_id] || 0) + points;
+      const total = kudos[user_id];
 
-    await axios.post(process.env.SLACK_WEBHOOK_URL, {
-      text: `🎉 <@${user_id}> received kudos!\nReason: ${text}\nTotal: ${kudos[user_id]}`
-    });
-  }
-
-  // /expertise
-  if (command === "/expertise") {
-    if (!expertise[user_id]) expertise[user_id] = [];
-
-    if (text.startsWith("add")) {
-      const skills = text.replace("add", "").split(",").map(s => s.trim());
-      expertise[user_id].push(...skills);
-
+      // Send formatted message using Slack Blocks
       await axios.post(process.env.SLACK_WEBHOOK_URL, {
-        text: `🧠 <@${user_id}> added expertise: ${skills.join(", ")}`
-      });
-    } else {
-      await axios.post(process.env.SLACK_WEBHOOK_URL, {
-        text: `🧠 <@${user_id}> expertise: ${(expertise[user_id] || []).join(", ") || "None"}`
+        blocks: [
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: `:tada: *Kudos to <@${user_id}>!*` }
+          },
+          { type: "divider" },
+          {
+            type: "section",
+            text: { type: "mrkdwn", text: `*Why:* ${text}` }
+          },
+          {
+            type: "section",
+            text: {
+              type: "mrkdwn",
+              text: `*Points:* ${points} 🎉  | *Total:* ${total} :star2:`
+            }
+          }
+        ]
       });
     }
-  }
 
-  // /leaderboard
-  if (command === "/leaderboard") {
-    const board = Object.entries(kudos)
-      .sort((a, b) => b[1] - a[1])
-      .map(([id, points]) => `<@${id}>: ${points}`)
-      .join("\n");
+    else if (command === "/expertise") {
+      // Example: add or show expertise
+      const [action, ...rest] = text.split(" ");
+      const skill = rest.join(" ");
 
-    await axios.post(process.env.SLACK_WEBHOOK_URL, {
-      text: `🏆 Leaderboard:\n${board || "No kudos yet"}`
-    });
+      if (action === "add" && skill) {
+        expertise[user_id] = expertise[user_id] || [];
+        expertise[user_id].push(skill);
+
+        await axios.post(process.env.SLACK_WEBHOOK_URL, {
+          blocks: [
+            {
+              type: "section",
+              text: {
+                type: "mrkdwn",
+                text: `:star2: <@${user_id}> added new expertise: *${skill}*`
+              }
+            }
+          ]
+        });
+      } else if (action === "show") {
+        const skills = (expertise[user_id] || []).join(", ") || "No expertise added yet.";
+        await axios.post(process.env.SLACK_WEBHOOK_URL, {
+          blocks: [
+            {
+              type: "section",
+              text: {
+                type: "mrkdwn",
+                text: `:bulb: <@${user_id}>'s expertise: *${skills}*`
+              }
+            }
+          ]
+        });
+      }
+    }
+
+    else if (command === "/leaderboard") {
+      // Simple leaderboard sorted by total kudos
+      const sorted = Object.entries(kudos)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5); // top 5
+
+      const leaderboardText = sorted
+        .map(([uid, total], i) => `${i + 1}. <@${uid}> — *${total} points*`)
+        .join("\n") || "No kudos yet.";
+
+      await axios.post(process.env.SLACK_WEBHOOK_URL, {
+        blocks: [
+          { type: "section", text: { type: "mrkdwn", text: ":trophy: *Leaderboard*" } },
+          { type: "divider" },
+          { type: "section", text: { type: "mrkdwn", text: leaderboardText } }
+        ]
+      });
+    }
+  } catch (err) {
+    console.error("Error sending Slack message:", err.message);
   }
 });
 
-// --------------------
+// Simple landing page with "Add to Slack"
+app.get("/", (req, res) => {
+  res.send('<h1>BadgeUp</h1><a href="/slack/install">Add to Slack</a>');
+});
+
+// Slack OAuth install route
+app.get("/slack/install", (req, res) => {
+  const clientId = process.env.SLACK_CLIENT_ID;
+  const redirectUri = process.env.REDIRECT_URI;
+  const slackUrl = `https://slack.com/oauth/v2/authorize?client_id=${clientId}&scope=commands,chat:write,users:read&redirect_uri=${redirectUri}`;
+  res.redirect(slackUrl);
+});
+
+// Slack OAuth callback
+app.get("/slack/oauth/callback", (req, res) => {
+  res.send("Slack OAuth callback hit! BadgeUp is installed.");
+});
+
 app.listen(PORT, () => {
   console.log(`🚀 BadgeUp running on port ${PORT}`);
 });

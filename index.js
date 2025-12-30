@@ -381,6 +381,269 @@ app.post("/slack/commands", async (req, res) => {
   }
 });
 
+// --------------------- Slack Interactivity (Shortcuts & Modals) ---------------------
+app.post("/slack/interactivity", async (req, res) => {
+  try {
+    console.log("Received interactivity request");
+    console.log("Body:", req.body);
+    
+    const payload = JSON.parse(req.body.payload);
+    console.log("Parsed payload type:", payload.type);
+    console.log("Callback ID:", payload.callback_id);
+
+    // Handle shortcuts
+    if (payload.type === "shortcut") {
+      const { trigger_id, callback_id, user } = payload;
+      console.log("Processing shortcut:", callback_id);
+
+      // Ask Question Shortcut
+      if (callback_id === "ask_question_shortcut") {
+        console.log("Ask question shortcut triggered");
+        console.log("Current badges:", badges);
+        
+        // Check if there are any badges
+        if (badges.length === 0) {
+          console.log("No badges available");
+          // Can't open modal without badges, send ephemeral message instead
+          try {
+            await axios.post("https://slack.com/api/chat.postEphemeral", {
+              channel: payload.channel?.id || user.id,
+              user: user.id,
+              text: "❌ No badges available. Create a badge first with `/create-badge [name]`"
+            }, {
+              headers: { "Authorization": `Bearer ${process.env.SLACK_BOT_TOKEN}` }
+            });
+          } catch (err) {
+            console.error("Error sending ephemeral message:", err.response?.data || err);
+          }
+          return res.sendStatus(200);
+        }
+
+        const modal = {
+          type: "modal",
+          callback_id: "ask_question_modal",
+          title: { type: "plain_text", text: "Ask a Question" },
+          submit: { type: "plain_text", text: "Post Question" },
+          close: { type: "plain_text", text: "Cancel" },
+          blocks: [
+            {
+              type: "input",
+              block_id: "badge_block",
+              label: { type: "plain_text", text: "Badge" },
+              element: {
+                type: "static_select",
+                action_id: "badge_select",
+                placeholder: { type: "plain_text", text: "Select a badge" },
+                // 👇 THIS IS THE KEY: We dynamically build options from the badges array
+                options: badges.map(b => ({
+                  text: { type: "plain_text", text: b },
+                  value: b
+                }))
+              }
+            },
+            {
+              type: "input",
+              block_id: "question_block",
+              label: { type: "plain_text", text: "Question" },
+              element: {
+                type: "plain_text_input",
+                action_id: "question_input",
+                multiline: true,
+                placeholder: { type: "plain_text", text: "Type your question here..." }
+              }
+            }
+          ]
+        };
+
+        try {
+          console.log("Opening modal with trigger_id:", trigger_id);
+          const response = await axios.post("https://slack.com/api/views.open", {
+            trigger_id: trigger_id,
+            view: modal
+          }, {
+            headers: { 
+              "Authorization": `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+              "Content-Type": "application/json"
+            }
+          });
+          console.log("Modal response:", response.data);
+          
+          if (!response.data.ok) {
+            console.error("Modal error:", response.data.error);
+          }
+        } catch (err) {
+          console.error("Error opening modal:", err.response?.data || err.message);
+        }
+      }
+
+      // Award Best Answer Shortcut
+      if (callback_id === "award_answer_shortcut") {
+        console.log("Award answer shortcut triggered");
+        
+        const modal = {
+          type: "modal",
+          callback_id: "award_answer_modal",
+          title: { type: "plain_text", text: "Award Best Answer" },
+          submit: { type: "plain_text", text: "Award Points" },
+          close: { type: "plain_text", text: "Cancel" },
+          blocks: [
+            {
+              type: "input",
+              block_id: "question_id_block",
+              label: { type: "plain_text", text: "Question ID" },
+              element: {
+                type: "plain_text_input",
+                action_id: "question_id_input",
+                placeholder: { type: "plain_text", text: "e.g., 5" }
+              }
+            },
+            {
+              type: "input",
+              block_id: "user_block",
+              label: { type: "plain_text", text: "User to Award" },
+              element: {
+                type: "users_select",
+                action_id: "user_select",
+                placeholder: { type: "plain_text", text: "Select a user" }
+              }
+            },
+            {
+              type: "input",
+              block_id: "points_block",
+              label: { type: "plain_text", text: "Points (default: 5)" },
+              optional: true,
+              element: {
+                type: "plain_text_input",
+                action_id: "points_input",
+                placeholder: { type: "plain_text", text: "5" }
+              }
+            }
+          ]
+        };
+
+        try {
+          console.log("Opening award modal with trigger_id:", trigger_id);
+          const response = await axios.post("https://slack.com/api/views.open", {
+            trigger_id: trigger_id,
+            view: modal
+          }, {
+            headers: { 
+              "Authorization": `Bearer ${process.env.SLACK_BOT_TOKEN}`,
+              "Content-Type": "application/json"
+            }
+          });
+          console.log("Modal response:", response.data);
+          
+          if (!response.data.ok) {
+            console.error("Modal error:", response.data.error);
+          }
+        } catch (err) {
+          console.error("Error opening modal:", err.response?.data || err.message);
+        }
+      }
+
+      return res.sendStatus(200);
+    }
+
+    // Handle modal submissions
+    if (payload.type === "view_submission") {
+      const { view, user } = payload;
+
+      // Ask Question Modal Submission
+      if (view.callback_id === "ask_question_modal") {
+        const badge = view.state.values.badge_block.badge_select.selected_option.value;
+        const questionText = view.state.values.question_block.question_input.value;
+
+        const questionId = questions.length + 1;
+        questions.push({
+          id: questionId,
+          userId: user.id,
+          userName: user.name,
+          text: questionText,
+          badge: badge,
+          timestamp: Date.now(),
+          bestAnswer: null
+        });
+
+        const experts = getUsersWithBadge(badge);
+        const expertTags = experts.length > 0 
+          ? experts.map(id => `<@${id}>`).join(" ")
+          : "_No experts with this badge yet_";
+
+        await postToSlack(
+          `❓ *New Question [#${questionId}]*\n` +
+          `Badge: *${badge}*\n` +
+          `Asked by: <@${user.id}>\n` +
+          `Question: ${questionText}\n\n` +
+          `📢 Tagging experts: ${expertTags}`
+        );
+
+        return res.sendStatus(200);
+      }
+
+      // Award Answer Modal Submission
+      if (view.callback_id === "award_answer_modal") {
+        const questionId = parseInt(view.state.values.question_id_block.question_id_input.value);
+        const answererUserId = view.state.values.user_block.user_select.selected_user;
+        const pointsInput = view.state.values.points_block.points_input.value;
+        const points = pointsInput ? parseInt(pointsInput) : 5;
+
+        const question = questions.find(q => q.id === questionId);
+
+        if (!question) {
+          // Can't send error in modal submission, will just fail silently
+          return res.sendStatus(200);
+        }
+
+        if (question.userId !== user.id) {
+          return res.sendStatus(200);
+        }
+
+        if (question.bestAnswer) {
+          return res.sendStatus(200);
+        }
+
+        // Award points
+        question.bestAnswer = { userId: answererUserId, points: points };
+        weeklyPoints[answererUserId] = (weeklyPoints[answererUserId] || 0) + points;
+
+        if (!lifetimePoints[answererUserId]) lifetimePoints[answererUserId] = {};
+        if (!lifetimePoints[answererUserId][question.badge]) {
+          lifetimePoints[answererUserId][question.badge] = 0;
+        }
+        lifetimePoints[answererUserId][question.badge] += points;
+
+        const lifetimePointsInBadge = lifetimePoints[answererUserId][question.badge];
+        const badgeEarned = checkAndAwardBadge(answererUserId, question.badge, lifetimePointsInBadge);
+
+        let message = 
+          `🏆 *Best Answer Awarded!*\n` +
+          `Question #${questionId}: "${question.text}"\n` +
+          `Badge: *${question.badge}*\n` +
+          `Winner: <@${answererUserId}>\n` +
+          `Points: *+${points} pts*\n` +
+          `Weekly total: ${weeklyPoints[answererUserId]} pts\n` +
+          `Lifetime in ${question.badge}: ${lifetimePointsInBadge} pts`;
+
+        if (badgeEarned) {
+          message += `\n\n🎉 *BADGE EARNED!* 🎉\n<@${answererUserId}> earned the *${question.badge}* badge!`;
+        }
+
+        await postToSlack(message);
+
+        return res.sendStatus(200);
+      }
+    }
+
+    res.sendStatus(200);
+  } catch (err) {
+    console.error("Interactivity error:", err);
+    console.error("Error details:", err.response?.data || err.message);
+    console.error("Stack:", err.stack);
+    res.sendStatus(500);
+  }
+});
+
 // --------------------- Health Check ---------------------
 app.get("/health", (req, res) => {
   res.json({ status: "ok", timestamp: new Date() });

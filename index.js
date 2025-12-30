@@ -2,6 +2,7 @@ require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
 const bodyParser = require("body-parser");
+const cron = require("node-cron");
 
 const app = express();
 app.use(bodyParser.urlencoded({ extended: true }));
@@ -10,147 +11,287 @@ app.use(bodyParser.json());
 const PORT = process.env.PORT || 3000;
 
 // --------------------- In-memory storage ---------------------
-let kudos = {}; // { userId: points }
-let users = {}; // { userId: { badges: [] } }
-let questions = []; // { id, userId, text, badge, answeredBy: [], bestAnswer: null }
-let badgesList = ["React", "Node.js", "Python"]; // Predefined badges
+let badges = []; // ["React", "Node.js", "Python"]
+let questions = []; // { id, userId, text, badge, timestamp, bestAnswer: { userId, points } }
+let weeklyPoints = {}; // { badge: { userId: points } }
+let allTimePoints = {}; // { badge: { userId: points } }
 
-// --------------------- Helper ---------------------
-async function postToSlack(message) {
+// --------------------- Helper Functions ---------------------
+async function postToSlack(message, channel) {
   try {
-    await axios.post(process.env.SLACK_WEBHOOK_URL, { text: message });
+    await axios.post(process.env.SLACK_WEBHOOK_URL, { 
+      text: message,
+      channel: channel 
+    });
   } catch (err) {
     console.error("Error posting to Slack:", err);
   }
 }
 
-// --------------------- /slack/commands ---------------------
+function resetWeeklyPoints() {
+  weeklyPoints = {};
+}
+
+function getUserMention(userId) {
+  return `<@${userId}>`;
+}
+
+// --------------------- Scheduled Tasks ---------------------
+// Post leaderboard every Monday at 9 AM
+cron.schedule("0 9 * * 1", async () => {
+  console.log("Running weekly leaderboard post...");
+  
+  for (const badge of badges) {
+    const points = weeklyPoints[badge] || {};
+    const topUsers = Object.entries(points)
+      .map(([userId, pts]) => ({ userId, points: pts }))
+      .sort((a, b) => b.points - a.points)
+      .slice(0, 10);
+    
+    if (topUsers.length > 0) {
+      const leaderboard = topUsers
+        .map((entry, idx) => `${idx + 1}. ${getUserMention(entry.userId)}: ${entry.points} pts`)
+        .join("\n");
+      
+      await postToSlack(
+        `📊 *Weekly Leaderboard for ${badge}*\n\n${leaderboard}\n\n_Resetting for next week..._`
+      );
+    }
+  }
+  
+  resetWeeklyPoints();
+});
+
+// --------------------- Slack Commands ---------------------
 app.post("/slack/commands", async (req, res) => {
-  const { command, text, user_id, user_name } = req.body;
-  res.send(""); // Must respond <3s
+  const { command, text, user_id, user_name, channel_id } = req.body;
+  res.send(""); // Must respond within 3s
 
   try {
     switch (command) {
-      // ---------------- /kudos ----------------
-      case "/kudos": {
-        kudos[user_id] = (kudos[user_id] || 0) + 5;
+      // ---------------- /domain ----------------
+      case "/domain": {
+        const badgeName = text.trim();
+        if (!badgeName) {
+          await postToSlack("❌ Please provide a badge name. Usage: `/domain [badge name]`");
+          break;
+        }
+        
+        if (badges.includes(badgeName)) {
+          await postToSlack(`❌ Badge "${badgeName}" already exists.`);
+          break;
+        }
+        
+        badges.push(badgeName);
+        weeklyPoints[badgeName] = {};
+        allTimePoints[badgeName] = {};
+        
         await postToSlack(
-          `:tada: Kudos to <@${user_id}>!\n========\nWhy: ${text}\n5 points! 🎉\nTotal: ${kudos[user_id]}`
+          `🎯 *New badge created!*\n` +
+          `Badge: *${badgeName}*\n` +
+          `Created by: ${getUserMention(user_id)}\n` +
+          `Total badges: ${badges.length}`
         );
         break;
       }
 
       // ---------------- /addbadge ----------------
       case "/addbadge": {
-        const badge = text.trim();
-        if (!badge) {
-          await postToSlack("❌ Please provide a badge name.");
+        const badgeName = text.trim();
+        if (!badgeName) {
+          await postToSlack("❌ Please provide a badge name. Usage: `/addbadge [badge name]`");
           break;
         }
-        if (!users[user_id]) users[user_id] = { badges: [] };
-        if (!users[user_id].badges.includes(badge)) users[user_id].badges.push(badge);
-        if (!badgesList.includes(badge)) badgesList.push(badge);
+        
+        if (badges.includes(badgeName)) {
+          await postToSlack(`❌ Badge "${badgeName}" already exists.`);
+          break;
+        }
+        
+        badges.push(badgeName);
+        weeklyPoints[badgeName] = {};
+        allTimePoints[badgeName] = {};
+        
         await postToSlack(
-          `🏅 <@${user_id}> added badge: ${badge}\nYour badges: ${users[user_id].badges.join(", ")}`
+          `🏅 *New badge added!*\n` +
+          `Badge: *${badgeName}*\n` +
+          `Added by: ${getUserMention(user_id)}`
         );
         break;
       }
 
       // ---------------- /question ----------------
       case "/question": {
-        const [badge, ...questionParts] = text.split("|").map(s => s.trim());
-        if (!badge || questionParts.length === 0) {
-          await postToSlack("❌ Usage: /question [badge] | [your question]");
+        // Format: /question [badge] [question text] @user1 @user2
+        const parts = text.trim().split(/\s+/);
+        if (parts.length < 2) {
+          await postToSlack("❌ Usage: `/question [badge] [question] @user1 @user2...`");
           break;
         }
-        const questionText = questionParts.join(" ");
+        
+        const badge = parts[0];
+        const restText = parts.slice(1).join(" ");
+        
+        // Extract mentioned users
+        const mentionPattern = /<@([A-Z0-9]+)(\|[^>]+)?>/g;
+        const mentions = [...restText.matchAll(mentionPattern)].map(m => m[1]);
+        
+        // Remove mentions from question text
+        const questionText = restText.replace(mentionPattern, "").trim();
+        
+        if (!badges.includes(badge)) {
+          await postToSlack(`❌ Badge "${badge}" doesn't exist. Create it first with \`/domain ${badge}\``);
+          break;
+        }
+        
         const questionId = questions.length + 1;
         questions.push({
           id: questionId,
           userId: user_id,
           text: questionText,
-          badge,
-          answeredBy: [],
+          badge: badge,
+          timestamp: Date.now(),
+          mentionedUsers: mentions,
           bestAnswer: null
         });
-        await postToSlack(`❓ <@${user_id}> asked a question for badge ${badge}:\n${questionText}\nQuestion ID: ${questionId}`);
-        break;
-      }
-
-      // ---------------- /answer ----------------
-      case "/answer": {
-        const [qidStr, answerText] = text.split("|").map(s => s.trim());
-        const qid = parseInt(qidStr);
-        const question = questions.find(q => q.id === qid);
-        if (!question) {
-          await postToSlack(`❌ Question ID ${qid} not found.`);
-          break;
-        }
-        question.answeredBy.push({ userId: user_id, answer: answerText });
-        await postToSlack(`✅ <@${user_id}> answered question ID ${qid}:\n${answerText}`);
+        
+        const mentionsList = mentions.length > 0 
+          ? mentions.map(id => getUserMention(id)).join(" ") 
+          : "";
+        
+        await postToSlack(
+          `❓ *New Question [#${questionId}]*\n` +
+          `Badge: *${badge}*\n` +
+          `Asked by: ${getUserMention(user_id)}\n` +
+          `Question: ${questionText}\n` +
+          (mentionsList ? `Tagged: ${mentionsList}` : "")
+        );
         break;
       }
 
       // ---------------- /best-answer ----------------
       case "/best-answer": {
-        const [qidStr, bestUserTag, pointsStr] = text.split("|").map(s => s.trim());
-        const qid = parseInt(qidStr);
-        const points = parseInt(pointsStr);
-        const question = questions.find(q => q.id === qid);
+        // Format: /best-answer [question-id] @user [points]
+        const parts = text.trim().split(/\s+/);
+        if (parts.length < 3) {
+          await postToSlack("❌ Usage: `/best-answer [question-id] @user [points]`");
+          break;
+        }
+        
+        const questionId = parseInt(parts[0]);
+        const userMatch = parts[1].match(/<@([A-Z0-9]+)(\|[^>]+)?>/);
+        const points = parseInt(parts[2]);
+        
+        if (!userMatch || isNaN(points)) {
+          await postToSlack("❌ Invalid format. Usage: `/best-answer [question-id] @user [points]`");
+          break;
+        }
+        
+        const answererUserId = userMatch[1];
+        const question = questions.find(q => q.id === questionId);
+        
         if (!question) {
-          await postToSlack(`❌ Question ID ${qid} not found.`);
+          await postToSlack(`❌ Question #${questionId} not found.`);
           break;
         }
-        question.bestAnswer = bestUserTag;
-        kudos[bestUserTag] = (kudos[bestUserTag] || 0) + points;
-        await postToSlack(`🏆 <@${bestUserTag}> marked as best answer for question ID ${qid} (+${points} pts)`);
-        break;
-      }
-
-      // ---------------- /questions ----------------
-      case "/questions": {
-        const badgeFilter = text.trim();
-        const filteredQuestions = badgeFilter
-          ? questions.filter(q => q.badge.toLowerCase() === badgeFilter.toLowerCase())
-          : questions;
-        if (!filteredQuestions.length) {
-          await postToSlack("❌ No questions found.");
+        
+        if (question.userId !== user_id) {
+          await postToSlack(`❌ Only the question asker can mark the best answer.`);
           break;
         }
-        const message = filteredQuestions
-          .map(q => `ID ${q.id} | ${q.badge} | <@${q.userId}>: ${q.text}`)
-          .join("\n");
-        await postToSlack(`📄 Questions:\n${message}`);
+        
+        if (question.bestAnswer) {
+          await postToSlack(`❌ Question #${questionId} already has a best answer.`);
+          break;
+        }
+        
+        // Award points
+        question.bestAnswer = { userId: answererUserId, points: points };
+        
+        if (!weeklyPoints[question.badge]) weeklyPoints[question.badge] = {};
+        if (!allTimePoints[question.badge]) allTimePoints[question.badge] = {};
+        
+        weeklyPoints[question.badge][answererUserId] = 
+          (weeklyPoints[question.badge][answererUserId] || 0) + points;
+        allTimePoints[question.badge][answererUserId] = 
+          (allTimePoints[question.badge][answererUserId] || 0) + points;
+        
+        await postToSlack(
+          `🏆 *Best Answer Awarded!*\n` +
+          `Question #${questionId}: "${question.text}"\n` +
+          `Badge: *${question.badge}*\n` +
+          `Winner: ${getUserMention(answererUserId)}\n` +
+          `Points: *${points}*\n` +
+          `Awarded by: ${getUserMention(user_id)}`
+        );
         break;
       }
 
       // ---------------- /leaderboard ----------------
       case "/leaderboard": {
-        const badgeFilter = text.trim();
-        let filteredQuestions = badgeFilter
-          ? questions.filter(q => q.badge.toLowerCase() === badgeFilter.toLowerCase())
-          : questions;
-        const leaderboardPoints = {};
-
-        filteredQuestions.forEach(q => {
-          if (q.bestAnswer) {
-            leaderboardPoints[q.bestAnswer] = (leaderboardPoints[q.bestAnswer] || 0) + 1;
+        const badge = text.trim();
+        
+        if (badge && !badges.includes(badge)) {
+          await postToSlack(`❌ Badge "${badge}" doesn't exist.`);
+          break;
+        }
+        
+        if (badge) {
+          // Show leaderboard for specific badge
+          const points = weeklyPoints[badge] || {};
+          const topUsers = Object.entries(points)
+            .map(([userId, pts]) => ({ userId, points: pts }))
+            .sort((a, b) => b.points - a.points)
+            .slice(0, 10);
+          
+          if (topUsers.length === 0) {
+            await postToSlack(`📊 No points awarded yet for *${badge}* this week.`);
+            break;
           }
-        });
-
-        const topUsers = Object.keys(leaderboardPoints)
-          .map(u => ({ user: u, points: leaderboardPoints[u] }))
-          .sort((a, b) => b.points - a.points)
-          .slice(0, 10)
-          .map(entry => `<@${entry.user}>: ${entry.points} pts`);
-
-        await postToSlack(`📊 Leaderboard${badgeFilter ? ` for ${badgeFilter}` : ""}:\n${topUsers.join("\n")}`);
+          
+          const leaderboard = topUsers
+            .map((entry, idx) => `${idx + 1}. ${getUserMention(entry.userId)}: ${entry.points} pts`)
+            .join("\n");
+          
+          await postToSlack(
+            `📊 *Weekly Leaderboard for ${badge}*\n\n${leaderboard}`
+          );
+        } else {
+          // Show table of all badges with top person
+          if (badges.length === 0) {
+            await postToSlack("📊 No badges created yet.");
+            break;
+          }
+          
+          let table = "*Badge | Top Person | Points*\n";
+          table += "━━━━━━━━━━━━━━━━━━━━━━━━\n";
+          
+          for (const badge of badges) {
+            const points = weeklyPoints[badge] || {};
+            const topUser = Object.entries(points)
+              .map(([userId, pts]) => ({ userId, points: pts }))
+              .sort((a, b) => b.points - a.pts)[0];
+            
+            if (topUser) {
+              table += `${badge} | ${getUserMention(topUser.userId)} | ${topUser.points}\n`;
+            } else {
+              table += `${badge} | _No activity_ | 0\n`;
+            }
+          }
+          
+          await postToSlack(`📊 *Weekly Leaderboard - All Badges*\n\n${table}`);
+        }
         break;
       }
 
       // ---------------- /badges ----------------
       case "/badges": {
-        await postToSlack(`🏅 All badges: ${badgesList.join(", ")}`);
+        if (badges.length === 0) {
+          await postToSlack("🏅 No badges created yet. Use `/domain [badge name]` to create one.");
+          break;
+        }
+        
+        await postToSlack(`🏅 *Available Badges:*\n${badges.map(b => `• ${b}`).join("\n")}`);
         break;
       }
 
@@ -159,11 +300,11 @@ app.post("/slack/commands", async (req, res) => {
     }
   } catch (err) {
     console.error("Error handling command:", err);
-    await postToSlack(`❌ Error processing command ${command}`);
+    await postToSlack(`❌ Error processing command ${command}: ${err.message}`);
   }
 });
 
-// --------------------- /slack/interactivity ---------------------
+// --------------------- Slack Interactivity (Autocomplete) ---------------------
 app.post("/slack/interactivity", async (req, res) => {
   try {
     const payload = JSON.parse(req.body.payload);
@@ -172,15 +313,28 @@ app.post("/slack/interactivity", async (req, res) => {
       const { name, value } = payload;
       let options = [];
 
+      // Autocomplete for badge names
       if (name === "badge") {
-        options = badgesList
+        options = badges
           .filter(b => b.toLowerCase().includes(value.toLowerCase()))
-          .map(b => ({ text: { type: "plain_text", text: b }, value: b }));
-      } else if (name === "question") {
+          .map(b => ({ 
+            text: { type: "plain_text", text: b }, 
+            value: b 
+          }));
+      } 
+      // Autocomplete for questions
+      else if (name === "question") {
         options = questions
-          .filter(q => `${q.id} ${q.badge} ${q.text}`.toLowerCase().includes(value.toLowerCase()))
+          .filter(q => {
+            const searchStr = `${q.id} ${q.badge} ${q.text}`.toLowerCase();
+            return searchStr.includes(value.toLowerCase());
+          })
+          .slice(0, 20) // Limit to 20 results
           .map(q => ({
-            text: { type: "plain_text", text: `ID ${q.id} | ${q.badge} | ${q.text}` },
+            text: { 
+              type: "plain_text", 
+              text: `#${q.id} | ${q.badge} | ${q.text.substring(0, 50)}...` 
+            },
             value: `${q.id}`
           }));
       }
@@ -195,5 +349,8 @@ app.post("/slack/interactivity", async (req, res) => {
   }
 });
 
-// --------------------- Start server ---------------------
-app.listen(PORT, () => console.log(`🚀 BadgeUp running on port ${PORT}`));
+// --------------------- Start Server ---------------------
+app.listen(PORT, () => {
+  console.log(`🚀 Slack Badge App running on port ${PORT}`);
+  console.log(`📅 Weekly leaderboard scheduled for Mondays at 9 AM`);
+});
